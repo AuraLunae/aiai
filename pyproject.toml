@@ -1,0 +1,27 @@
+[project]
+name = "umbrella-rain-project"
+version = "0.1.0"
+description = "Optimal umbrella tilt angle for a couple: particle rain + Genesis World rendering (GPU)"
+requires-python = ">=3.10,<3.14"  # torch(cu126)のwheelがcp313までのため、3.14が自動選択されないよう上限を設定
+dependencies = [
+    "torch>=2.8.0",
+    "genesis-world",
+    "numpy",
+    "scipy",
+    "trimesh",
+    "opencv-python",
+    "imageio[ffmpeg]",
+    "matplotlib",
+]
+
+# PyTorchはCUDAビルドをuvのindexで明示的に指定する。
+# 使っているCUDAバージョンに合わせて書き換えること(下記はCUDA 12.6の例)。
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu126" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

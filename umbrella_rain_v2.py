@@ -29,8 +29,10 @@ v1 からの主な変更:
 
 import argparse
 import csv
+import sys
 import time
 import types
+from pathlib import Path
 import math
 import os
 
@@ -278,6 +280,18 @@ def prep_model(path, kind, axis_arg, size, grip, cache, keep_all, a=None):
         parts = kept
 
     ucol = getattr(a, "umbrella_color", None)
+    if kind == "umbrella" and not ucol:  # 指定が無く、材質の色情報も無い(全パーツが既定のグレー)なら紺色にする
+
+        def _plain(g):
+            try:
+                fc = np.asarray(g.visual.face_colors)
+                return bool(np.all(fc.reshape(-1, fc.shape[-1])[:, :3] == 150))
+            except Exception:
+                return False
+
+        if all(_plain(g) for g in parts):
+            ucol = (35, 60, 125)
+            print("  傘の色: 材質の色情報が無いため既定の紺色を適用します(--umbrella-color R G B で変更)")
     if kind == "umbrella" and ucol:  # 面積の大きいパーツ(=布)だけ着色。骨・柄は金属グレーのまま
         tot_a = sum(g.area for g in parts) + 1e-12
         for g in parts:
@@ -548,11 +562,13 @@ def place(A, a, theta):
     return R, quat, None, None
 
 
-def verify(A, a):
-    """すり抜け検証: 必ず表面を横切る線分(表面点を通る)を大量に作り、ボクセル走査が見逃す数を数える。"""
+def verify(A, a, n=30000, quiet=False):
+    """すり抜け検証: 必ず表面を横切る線分(表面点を通る)を大量に作り、ボクセル走査が見逃す数を数える。
+    戻り値: (見逃し数, 検査した線分数)"""
     rng = np.random.default_rng(0)
-    n = 30000
-    print(f"最大1ステップ移動量(想定) ≈ {(9.65 - 10.3 * math.exp(-0.6 * 5.5)) * a.dt * 100:.1f} cm / ボクセル {a.voxel * 100:.1f} cm")
+    if not quiet:
+        print(f"最大1ステップ移動量(想定) ≈ {(9.65 - 10.3 * math.exp(-0.6 * 5.5)) * a.dt * 100:.1f} cm / ボクセル {a.voxel * 100:.1f} cm")
+    tot_miss = tot_n = 0
     for name, mesh, grid in [("couple", A.cm, A.pgrid), ("umbrella", A.um, A.ugrid)]:
         p, _ = trimesh.sample.sample_surface(mesh, n)
         d = rng.normal(size=(n, 3))
@@ -563,7 +579,10 @@ def verify(A, a):
         t = lambda x: torch.tensor(x, dtype=torch.float32, device=A.dev)
         tag, _ = swept([(grid, None, None)], t(p0), t(d * L[:, None]), grid[2])
         miss = int((tag < 0).sum())
-        print(f"[{name}] 表面を横切る {n} 線分のうち、見逃し = {miss} ({100 * miss / n:.4f}%)")
+        tot_miss, tot_n = tot_miss + miss, tot_n + n
+        if not quiet:
+            print(f"[{name}] 表面を横切る {n} 線分のうち、見逃し = {miss} ({100 * miss / n:.4f}%)")
+    return tot_miss, tot_n
 
 
 # =============================================================================
@@ -772,10 +791,67 @@ def to_np(x):
 
 
 # =============================================================================
+OOM_ERRORS = tuple(e for e in (getattr(torch.cuda, "OutOfMemoryError", None),) if e) or (MemoryError,)
+MODEL_EXTS = (".obj", ".fbx", ".glb", ".gltf", ".stl", ".ply", ".dae", ".off")
+UMB_WORDS = ("umbrella", "parasol", "kasa", "傘")
+COUPLE_WORDS = ("couple", "pair", "people", "person", "human", "woman", "カップル", "二人", "人")
+FAST_PROFILE = dict(max_drops=60000, measure_s=2.0, warmup_s=1.0, step=15, res=[854, 480], draw_max=6000)
+
+
+def is_explicit(parser, dest):
+    """そのオプションがコマンドラインで明示指定されたか(明示指定された値は自動調整で上書きしない)。"""
+    argv = sys.argv[1:]
+    return any(t == o or t.startswith(o + "=") for ac in parser._actions if ac.dest == dest for o in ac.option_strings for t in argv)
+
+
+def resolve_models(a):
+    """--couple / --umbrella が無ければ、実行フォルダ・./assets・./models・このスクリプトのフォルダから探す。"""
+    if a.couple and a.umbrella:
+        return
+    here = Path(__file__).resolve().parent
+    dirs = []
+    for base in (Path.cwd(), here):
+        for sub in ("", "assets", "models", "model", "data"):
+            d = base / sub if sub else base
+            if d.is_dir() and d.resolve() not in [x.resolve() for x in dirs]:
+                dirs.append(d)
+    files = [f for d in dirs for f in sorted(d.iterdir()) if f.is_file() and f.suffix.lower() in MODEL_EXTS]
+    has = lambda f, words: any(w in f.stem.lower() for w in words)
+    umb = a.umbrella or next((str(f) for f in files if has(f, UMB_WORDS)), None)
+    cpl = a.couple or next((str(f) for f in files if str(f) != umb and has(f, COUPLE_WORDS)), None)
+    rest = [f for f in files if str(f) not in (umb, cpl)]
+    if cpl is None and umb is not None and len(rest) == 1:
+        cpl = str(rest[0])  # 傘以外のモデルがちょうど1つなら、それをカップルとみなす
+    if umb is None and cpl is not None and len(rest) == 1:
+        umb = str(rest[0])
+    if not (cpl and umb):
+        print("⚠ 3Dモデルを自動検出できませんでした。")
+        print("  探した場所: " + ", ".join(str(d) for d in dirs))
+        print("  見つかったモデル: " + (", ".join(f.name for f in files) if files else "(なし)"))
+        print("  対処: assets/ フォルダに couple.obj と Umbrella.obj を置くか、--couple <パス> --umbrella <パス> を指定してください。")
+        raise SystemExit(2)
+    print(f"モデルを自動検出: couple = {cpl} / umbrella = {umb}")
+    a.couple, a.umbrella = cpl, umb
+
+
+def apply_profile(a, parser, use_cuda):
+    """GPUが無い環境では、既定のままだと極端に遅いので軽い設定に自動で切り替える(明示指定した値は優先)。"""
+    prof = a.quality if a.quality != "auto" else ("high" if use_cuda else "fast")
+    if prof == "fast":
+        for k, v in FAST_PROFILE.items():
+            if not is_explicit(parser, k):
+                setattr(a, k, list(v) if isinstance(v, list) else v)
+    return prof
+
+
 def build_parser():
-    p = argparse.ArgumentParser()
-    p.add_argument("--couple", required=True)
-    p.add_argument("--umbrella", required=True)
+    p = argparse.ArgumentParser(
+        description="相合傘の最適な傾き角を探す。引数なしで実行すると、実行フォルダ・./assets・このスクリプトのフォルダから"
+                    "couple / umbrella のモデルを自動検出し、φ=0°と90°の全角度を測定して out/rain/ に動画・CSV・summary.md を出力する。")
+    p.add_argument("--couple", default=None, help="カップルの3Dモデルのパス。省略時は自動検出(名前に couple/pair/people 等)")
+    p.add_argument("--umbrella", default=None, help="傘の3Dモデルのパス。省略時は自動検出(名前に umbrella/傘 等)")
+    p.add_argument("--quality", default="auto", choices=["auto", "high", "fast"], help="auto=GPUがあればhigh、無ければfast(粒子数・測定時間・刻み・解像度を軽くする。個別に指定した値が優先)")
+    p.add_argument("--dry-run", action="store_true", help="実行計画(検出したモデル・デバイス・設定)だけ表示して終了")
     p.add_argument("--couple-axis", default="auto", choices=["auto"] + list(AXES), help="モデルの上方向(元データ上の軸)")
     p.add_argument("--umbrella-axis", default="auto", choices=["auto"] + list(AXES), help="傘の軸(石突→持ち手の逆=上)")
     p.add_argument("--keep-all", action="store_true", help="ゴミ/地面パーツの自動除去を無効化")
@@ -785,7 +861,7 @@ def build_parser():
     p.add_argument("--inspect", action="store_true", help="モデルの前処理(軸推定)だけ行って確認図を出力して終了")
     p.add_argument("--couple-height", type=float, default=None, help="省略時は単位(m/cm/mm)を自動推定。指定すると最大寸法をこの身長[m]に正規化")
     p.add_argument("--umbrella-diameter", type=float, default=None, help="省略時は単位を自動推定。指定すると傘の直径[m]に正規化")
-    p.add_argument("--umbrella-color", type=int, nargs=3, default=None, help="傘の布の色 R G B(0-255)。例: 40 70 130(紺)")
+    p.add_argument("--umbrella-color", type=int, nargs=3, default=None, help="傘の布の色 R G B(0-255)。省略時は、モデルに色情報が無ければ紺(35 60 125)")
     p.add_argument("--couple-spacing", type=float, default=None, help="二人の中心間距離[m]に調整(省略=モデルのまま)")
     p.add_argument("--grip-offset", type=float, default=0.25)
     p.add_argument("--hold", type=float, nargs=3, default=None)
@@ -804,7 +880,7 @@ def build_parser():
     p.add_argument("--voxel", type=float, default=0.01)
     p.add_argument("--dt", type=float, default=1 / 240)
     # スイープ
-    p.add_argument("--phi", type=float, default=0.0)
+    p.add_argument("--phi", type=float, nargs="+", default=[0.0, 90.0], help="傾ける方位[度]。複数指定可(0=二人を結ぶ軸方向、90=それに直交)。既定は 0 と 90 の両方")
     p.add_argument("--theta-min", type=int, default=-45)
     p.add_argument("--theta-max", type=int, default=45)
     p.add_argument("--step", type=int, default=5)
@@ -823,9 +899,9 @@ def build_parser():
     p.add_argument("--fov", type=float, default=40)
     p.add_argument("--draw-max", type=int, default=12000, help="領域内で描く雨粒の最大数(領域外の遠景は密度を揃えて自動追加)")
     p.add_argument("--streak-s", type=float, default=1 / 60, help="シャッター時間[s]。雨の筋の長さを決める")
-    p.add_argument("--renderer", default="genesis", choices=["genesis", "soft"], help="soft=CPUのみの簡易描画(Genesisの描画が動かない環境用)")
+    p.add_argument("--renderer", default="genesis", choices=["genesis", "soft"], help="genesis=Genesisで描画(失敗したら自動でsoftに切替) / soft=CPUのみの簡易描画")
     p.add_argument("--ssaa", type=int, default=0, help="スーパーサンプリング倍率。0=自動(GPUなら2、CPUなら1)")
-    p.add_argument("--depth-mode", default="zdepth", choices=["zdepth", "distance"], help="Genesisのdepthの意味。地面検出に失敗したら distance を試す")
+    p.add_argument("--depth-mode", default="auto", choices=["auto", "zdepth", "distance"], help="Genesisのdepthの意味。auto=実際に1枚描いて自動判定")
     p.add_argument("--dof", type=float, default=0.05, help="被写界深度の強さ(大きいほど手前/奥の雨が大きくボケる)")
     p.add_argument("--fog", type=float, default=0.05, help="霧の濃さ")
     p.add_argument("--gloss", type=float, default=2.2, help="路面の濡れ(反射)の強さ")
@@ -841,22 +917,103 @@ def build_parser():
     return p
 
 
+def theta_list(a):
+    """測定する傾き量[度]。刻みの倍数だけを使うので、範囲に含まれていれば 0° は必ず入る。"""
+    return sorted(t for t in range(a.theta_min, a.theta_max + 1) if t % a.step == 0)
+
+
+def print_plan(a, use_cuda, prof, phis):
+    n_theta = len(theta_list(a))
+    print("=" * 64)
+    print("実行計画")
+    print(f"  モデル   : couple = {a.couple}")
+    print(f"             umbrella = {a.umbrella}")
+    print(f"  デバイス : {'GPU (CUDA)' if use_cuda else 'CPU'} / 品質プロファイル: {prof}")
+    print(f"  測定     : φ = {[f'{p:.0f}' for p in phis]} × θ = {theta_list(a)[0]}〜{theta_list(a)[-1]}° を {a.step}° 刻み({n_theta} 角度)、"
+          f"1角度あたり測定 {a.measure_s}s(助走 {a.warmup_s}s)")
+    print(f"  雨       : {a.rain_mm_h} mm/h、粒子 最大 {a.max_drops}、風 ({a.wind_x}, {a.wind_y}) m/s、縁からの滴下の割合 {a.drip_fraction}")
+    print(f"  映像     : {'なし' if a.no_video else f'{a.res[0]}x{a.res[1]} {a.fps}fps'} / 出力先: {a.out}")
+    print("=" * 64)
+
+
+def write_summary(a, rows, phis):
+    """全方位・全角度を通した結論を summary.md に書き、結論部分をコンソールにも表示する。"""
+    ok = [r for r in rows if r["feasible"]]
+    L = ["# 相合傘 最適角度の結果", "",
+         f"- 降水強度 {a.rain_mm_h} mm/h / 風 ({a.wind_x}, {a.wind_y}) m/s / 縁からの滴下の割合 {a.drip_fraction} / 1角度あたり測定 {a.measure_s} s",
+         "- **濡れ率** = 傘なしを1とした水量比(小さいほど濡れない)。± は標準誤差(測定を5ブロックに分けて算出)",
+         "- 傾き: 傘の頂点が方位 φ の向き(φ=0 は二人を結ぶ軸の +x 側=人B側、φ=90 は +y 側)へ θ 度倒れる(θ<0 は逆向き)", ""]
+    concl = []
+    if not ok:
+        concl = ["実現可能な角度がありませんでした(すべて INFEASIBLE)。--hold-z-ratio / --max-hold-ratio / --couple-spacing を調整してください。"]
+    else:
+        bt = min(ok, key=lambda r: r["wet_total"])
+        bd = min(ok, key=lambda r: r["wet_direct"])
+        bm = min(ok, key=lambda r: r["wet_max"])
+        se2 = lambda r, b, k: 2 * math.hypot(r[k], b[k])
+        tie_t = [(int(r["phi"]), r["theta"]) for r in ok if r["wet_total"] <= bt["wet_total"] + se2(r, bt, "wet_total_se")]
+        tie_d = [(int(r["phi"]), r["theta"]) for r in ok if r["wet_direct"] <= bd["wet_direct"] + se2(r, bd, "wet_direct_se")]
+        concl = [
+            f"- **二人の合計が最も濡れない**: φ={bt['phi']:.0f}°, θ={bt['theta']:+d}°"
+            f"(合計 {bt['wet_total']:.3f}±{bt['wet_total_se']:.3f} / 人A {bt['wet_A']:.3f} / 人B {bt['wet_B']:.3f} / 傘の持ち上げ {bt['lift_m']:.2f} m)",
+            f"- **濡れの多い方が最小(二人の公平さ)**: φ={bm['phi']:.0f}°, θ={bm['theta']:+d}°"
+            f"(max {bm['wet_max']:.3f} / 人A {bm['wet_A']:.3f} / 人B {bm['wet_B']:.3f})",
+            f"- **直接の雨だけで見た最小**(縁からの滴下の仮定を除く): φ={bd['phi']:.0f}°, θ={bd['theta']:+d}°(合計 {bd['wet_direct']:.3f}±{bd['wet_direct_se']:.3f})",
+        ]
+        if len(tie_t) > 1:
+            concl.append(f"- 注意: 合計の濡れ率は {tie_t} が誤差(2σ)の範囲で区別できません。--measure-s を長く / --max-drops を増やすと絞れます。")
+        if (bt["phi"], bt["theta"]) != (bd["phi"], bd["theta"]):
+            concl.append("- 注意: 滴下を含めた場合と直接の雨だけの場合で最小の角度が異なります。滴下の仮定(--drip-fraction)に結論が左右されます。")
+    L += ["## 結論", ""] + concl + [""]
+    for phi in phis:
+        L += [f"## φ={phi:.0f}° の全角度", "", "| θ | 持上げ[m] | 人A | 人B | 合計 | 直接の雨のみ | max(A,B) |", "|---|---|---|---|---|---|---|"]
+        for r in [r for r in rows if r["phi"] == phi]:
+            if not r["feasible"]:
+                L.append(f"| {r['theta']:+d}° | - | INFEASIBLE | | | | |")
+            else:
+                L.append(f"| {r['theta']:+d}° | {r['lift_m']:.2f} | {r['wet_A']:.3f} | {r['wet_B']:.3f} | "
+                         f"{r['wet_total']:.3f}±{r['wet_total_se']:.3f} | {r['wet_direct']:.3f} | {r['wet_max']:.3f} |")
+        L.append("")
+    path = os.path.join(a.out, "summary.md")
+    open(path, "w", encoding="utf-8").write("\n".join(L))
+    print("\n" + "=" * 64)
+    print("結論(全方位を通した結果)")
+    for c in concl:
+        print(c)
+    print(f"詳細: {path}")
+    print("=" * 64)
+
+
 def main():
-    a = build_parser().parse_args()
+    parser = build_parser()
+    a = parser.parse_args()
+    phis = list(a.phi)
+    a.phi = phis[0]  # 以降の関数は φ を1つの数値として扱う(測定ループで都度設定する)
+    resolve_models(a)
     os.makedirs(a.out, exist_ok=True)
     if a.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("--device cuda が指定されましたが、CUDA が利用できません。")
     use_cuda = torch.cuda.is_available() if a.device == "auto" else a.device == "cuda"
-    if a.renderer == "soft":  # Genesis を使わない(物理・衝突判定・映像合成は torch)
+    prof = apply_profile(a, parser, use_cuda)
+    print_plan(a, use_cuda, prof, phis)
+    if a.dry_run:
+        return
+    soft = a.renderer == "soft"
+    dev = None
+    if not soft:
+        try:
+            gs.init(backend=gs.gpu if use_cuda else gs.cpu, logging_level="warning", seed=a.seed)
+            dev = gs.device
+        except Exception as e:
+            print(f"⚠ Genesis を初期化できないため、CPUソフトレンダラに切り替えます({type(e).__name__}: {e})")
+            soft = True
+    if dev is None:
         dev = torch.device("cuda" if use_cuda else "cpu")
-    else:
-        gs.init(backend=gs.gpu if use_cuda else gs.cpu, logging_level="warning", seed=a.seed)
-        dev = gs.device
     if use_cuda:
         p_ = torch.cuda.get_device_properties(0)
         print(f"デバイス: GPU ({p_.name}, VRAM {p_.total_memory / 2**30:.1f} GB) — 物理・映像合成はGPU上で実行")
     else:
-        print("⚠ GPU(CUDA)が見つかりません。CPUで実行します(かなり遅くなります)。")
+        print("⚠ GPU(CUDA)が見つかりません。CPUで実行します(軽い設定に自動調整済み。それでも時間がかかります)。")
     A = build_assets(a, dev)
 
     if a.inspect:
@@ -867,35 +1024,79 @@ def main():
         verify(A, a)
         return
 
+    # 自動のすり抜け検証(見逃しがあればボクセルを半分にして作り直す)
+    for _ in range(3):
+        miss, tot = verify(A, a, n=4000, quiet=True)
+        if miss == 0:
+            print(f"すり抜け検証: 表面を横切る {tot} 線分をすべて検出(見逃し 0) ✔")
+            break
+        if a.voxel <= 0.0025:
+            print(f"⚠ すり抜け検証: 見逃し {miss}/{tot}。ボクセルは十分細かいので続行します(--verify で詳細を確認してください)")
+            break
+        a.voxel /= 2
+        print(f"⚠ すり抜け検証: 見逃し {miss}/{tot} → ボクセルを {a.voxel * 100:.2f}cm に細かくして作り直します")
+        A = build_assets(a, dev)
+
+    # カメラ: 明示指定が無ければ、モデルの大きさに合わせて正面斜め前から(人は+y向きに歩いている想定)
+    sc_ = A.couple_h / 1.8
+    if not is_explicit(parser, "cam_pos"):
+        a.cam_pos = [2.0 * sc_, 4.3 * sc_, 1.5 * sc_]
+    if not is_explicit(parser, "cam_lookat"):
+        a.cam_lookat = [0.0, 0.0, 1.15 * sc_]
+
     ss = a.ssaa if a.ssaa > 0 else (2 if use_cuda else 1)
     enc_pref = a.encoder if a.encoder != "auto" else ("nvenc" if use_cuda else "libx264")
     W0, H0 = a.res
     W, Hh = W0 * ss, H0 * ss
     state = dict(R=None, H=None)
-    soft = a.renderer == "soft"
     umb = cam = scene = None
-    if not soft:
-        vis = None
-        for kw in (dict(background_color=(0.55, 0.60, 0.66), ambient_light=(0.55, 0.55, 0.60), shadow=True,
-                         lights=[dict(type="directional", dir=(-0.35, -0.45, -0.82), color=(1.0, 1.0, 1.02), intensity=3.0)]),
-                   dict(background_color=(0.55, 0.60, 0.66), ambient_light=(0.5, 0.5, 0.55)), dict()):
-            try:  # Genesisのバージョンで受け付ける VisOptions が違うため、通る組合せまで落とす
-                vis = gs.options.VisOptions(**kw)
-                break
-            except Exception:
-                continue
-        scene = gs.Scene(sim_options=gs.options.SimOptions(gravity=(0, 0, 0)), vis_options=vis, show_viewer=False)
-        try:
-            scene.add_entity(gs.morphs.Plane(), surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.20, 0.20, 0.22))))
-        except Exception:
-            scene.add_entity(gs.morphs.Plane())
-        scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.couple_glb), fixed=True, collision=False, parse_glb_with_zup=True))
-        umb = scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.umb_glb), pos=tuple(float(x) for x in A.hold),
-                                              fixed=False, collision=False, parse_glb_with_zup=True))
-        cam = scene.add_camera(res=(W, Hh), pos=tuple(a.cam_pos), lookat=tuple(a.cam_lookat), fov=a.fov, GUI=False)
-        scene.build()
     cam_geo = Camera(a.cam_pos, a.cam_lookat, a.fov, W, Hh)
     gcam = GpuCamera(cam_geo, dev)  # カメラ幾何はデバイスに1つだけ置き、全角度のレンダラで共有する
+    depth_cfg = dict(mode="distance" if a.depth_mode == "distance" else "zdepth", use=not a.no_depth)
+
+    def ground_frac(d):  # depth から再構成した点のうち、地面(z≈0)にある割合
+        fin = np.isfinite(d) & (d > 0.05) & (d < 200)
+        wz = cam_geo.pos[2] + np.where(fin, d, 0.0) * cam_geo.ray[..., 2]
+        return float((fin & (np.abs(wz) < 0.03)).mean())
+
+    if not soft:
+        try:
+            vis = None
+            for kw in (dict(background_color=(0.55, 0.60, 0.66), ambient_light=(0.55, 0.55, 0.60), shadow=True,
+                             lights=[dict(type="directional", dir=(-0.35, -0.45, -0.82), color=(1.0, 1.0, 1.02), intensity=3.0)]),
+                       dict(background_color=(0.55, 0.60, 0.66), ambient_light=(0.5, 0.5, 0.55)), dict()):
+                try:  # Genesisのバージョンで受け付ける VisOptions が違うため、通る組合せまで落とす
+                    vis = gs.options.VisOptions(**kw)
+                    break
+                except Exception:
+                    continue
+            scene = gs.Scene(sim_options=gs.options.SimOptions(gravity=(0, 0, 0)), vis_options=vis, show_viewer=False)
+            try:
+                scene.add_entity(gs.morphs.Plane(), surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.20, 0.20, 0.22))))
+            except Exception:
+                scene.add_entity(gs.morphs.Plane())
+            scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.couple_glb), fixed=True, collision=False, parse_glb_with_zup=True))
+            umb = scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.umb_glb), pos=tuple(float(x) for x in A.hold),
+                                                  fixed=False, collision=False, parse_glb_with_zup=True))
+            cam = scene.add_camera(res=(W, Hh), pos=tuple(a.cam_pos), lookat=tuple(a.cam_lookat), fov=a.fov, GUI=False)
+            scene.build()
+            # 描画の自己診断: 実際に1枚描き、depth の定義(前方距離か直線距離か)を自動判定する
+            out = cam.render(rgb=True, depth=not a.no_depth)
+            to_np(out[0])
+            if not a.no_depth:
+                d_ = np.squeeze(to_np(out[1])).astype(np.float32)
+                g1, g2 = ground_frac(d_), ground_frac(d_ / cam_geo.raylen)
+                if a.depth_mode == "auto":
+                    depth_cfg["mode"] = "zdepth" if g1 >= g2 else "distance"
+                if max(g1, g2) < 0.01:
+                    depth_cfg["use"] = False
+                    print("⚠ depth から地面を検出できないため、depth を使わずに描画します(空・路面・霧の処理を省略)。")
+                else:
+                    print(f"Genesis の描画を確認: depth の定義 = {depth_cfg['mode']}(地面検出 {100 * max(g1, g2):.1f}%)")
+        except Exception as e:
+            print(f"⚠ Genesis での描画に失敗したため、CPUソフトレンダラに切り替えます({type(e).__name__}: {e})")
+            soft = True
+            umb = cam = scene = None
 
     def make_renderer():
         rr = RainRenderer(gcam, a, ss=ss, seed=a.seed)
@@ -915,12 +1116,12 @@ def main():
             um_w = A.um.vertices @ state["R"].T + state["H"]
             return soft_render(cam_geo, [(A.cm.vertices, A.cm.faces, A.cm.metadata.get("face_colors")),
                                          (um_w, A.um.faces, A.um.metadata.get("face_colors"))], seed=a.seed)
-        out = cam.render(rgb=True, depth=not a.no_depth)
+        out = cam.render(rgb=True, depth=depth_cfg["use"])
         rgb = np.ascontiguousarray(to_np(out[0])).astype(np.uint8)
         depth = None
-        if not a.no_depth:
+        if depth_cfg["use"]:
             depth = np.squeeze(to_np(out[1])).astype(np.float32)
-            if a.depth_mode == "distance":  # 視点からの直線距離 → 前方距離へ
+            if depth_cfg["mode"] == "distance":  # 視点からの直線距離 → 前方距離へ
                 depth = depth / cam_geo.raylen
         return rgb, depth
 
@@ -1058,87 +1259,113 @@ def main():
     base_each = [b[1], b[2]]
     print(f"baseline(傘なし) 水量 mL/s: A={b[1]:.3f} B={b[2]:.3f}")
 
-    # --- 各角度の傘の姿勢を決める(干渉解決) → 実現可能なものを env-batch 個ずつまとめて同時に計算 ---
-    thetas = list(range(a.theta_min, a.theta_max + 1, a.step))
-    feas = {}
-    rows = {}
-    for theta in thetas:
-        R, quat, H, lift = place(A, a, theta)
-        if H is None:
-            print(f"θ={theta:+3d}°  INFEASIBLE(傘が人に干渉。腕の届く上限でも解消不可)")
-            rows[theta] = dict(theta=theta, phi=a.phi, lift_m=float("nan"), feasible=0, wet_A=float("nan"),
-                               wet_B=float("nan"), wet_total=float("nan"), wet_max=float("nan"), drip_share=float("nan"),
-                               wet_direct=float("nan"), wet_total_se=float("nan"), wet_A_se=float("nan"),
-                               wet_B_se=float("nan"), wet_direct_se=float("nan"))
+    def sweep(phi):
+        """方位 phi について全角度を測定し、動画・CSV・グラフを出力して行のリストを返す。"""
+        a.phi = phi
+        # --- 各角度の傘の姿勢を決める(干渉解決) → 実現可能なものを env-batch 個ずつまとめて同時に計算 ---
+        thetas = theta_list(a)
+        feas = {}
+        rows = {}
+        for theta in thetas:
+            R, quat, H, lift = place(A, a, theta)
+            if H is None:
+                print(f"θ={theta:+3d}°  INFEASIBLE(傘が人に干渉。腕の届く上限でも解消不可)")
+                rows[theta] = dict(theta=theta, phi=a.phi, lift_m=float("nan"), feasible=0, wet_A=float("nan"),
+                                   wet_B=float("nan"), wet_total=float("nan"), wet_max=float("nan"), drip_share=float("nan"),
+                                   wet_direct=float("nan"), wet_total_se=float("nan"), wet_A_se=float("nan"),
+                                   wet_B_se=float("nan"), wet_direct_se=float("nan"))
+            else:
+                feas[theta] = (R, H, quat, lift)
+        todo = list(feas)
+        if a.env_batch == 0:
+            bs = len(todo)
+        elif a.env_batch > 0:
+            bs = a.env_batch
+        elif use_cuda and todo:  # 自動: VRAMの空きに収まる最大数(物理テンソル + 映像用の角度ごとの状態)
+            probe = RainSim(a, A, 1)
+            per_sim = probe.n * 320 + probe.nd * 80
+            per_fx = 0 if a.no_video else W * Hh * 25  # 角度ごとに常駐する画像・濡れマップ
+            reserve = 0 if a.no_video else W * Hh * 250  # 合成の一時バッファ(角度で使い回す)
+            free = torch.cuda.mem_get_info()[0]
+            bs = int(max(1, min(len(todo), (0.7 * free - reserve) // (per_sim + per_fx))))
+            del probe
+            print(f"同時に計算する角度数: {bs} (VRAM空き {free / 2**30:.1f} GB から自動決定。--env-batch で変更可)")
         else:
-            feas[theta] = (R, H, quat, lift)
-    todo = list(feas)
-    if a.env_batch == 0:
-        bs = len(todo)
-    elif a.env_batch > 0:
-        bs = a.env_batch
-    elif use_cuda and todo:  # 自動: VRAMの空きに収まる最大数(物理テンソル + 映像用の角度ごとの状態)
-        probe = RainSim(a, A, 1)
-        per_sim = probe.n * 320 + probe.nd * 80
-        per_fx = 0 if a.no_video else W * Hh * 25  # 角度ごとに常駐する画像・濡れマップ
-        reserve = 0 if a.no_video else W * Hh * 250  # 合成の一時バッファ(角度で使い回す)
-        free = torch.cuda.mem_get_info()[0]
-        bs = int(max(1, min(len(todo), (0.7 * free - reserve) // (per_sim + per_fx))))
-        del probe
-        print(f"同時に計算する角度数: {bs} (VRAM空き {free / 2**30:.1f} GB から自動決定。--env-batch で変更可)")
+            bs = min(len(todo), 4) if todo else 1
+        pos_i = 0
+        while pos_i < len(todo):
+            chunk = todo[pos_i:pos_i + max(1, bs)]
+            vids = None if a.no_video else [os.path.join(a.out, f"phi{int(a.phi):03d}_theta{t:+03d}.mp4") for t in chunk]
+            hdr = [[f"tilt theta={t:+d} deg (phi={a.phi:.0f})  lift={feas[t][3]:.2f} m"] for t in chunk]
+            try:
+                acc, blk = simulate([feas[t] for t in chunk], a.measure_s, vids, hdr)
+            except OOM_ERRORS:  # GPUメモリ不足: 同時に計算する角度数を半分にして、同じ角度グループをやり直す
+                if bs <= 1:
+                    raise
+                bs = max(1, len(chunk) // 2)
+                print(f"⚠ GPUメモリ不足 → 同時に計算する角度数を {bs} に減らして再試行します(--ssaa 1 や --env-batch でも調整できます)")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            pos_i += len(chunk)
+            for t, c, bk in zip(chunk, acc, blk):
+                wA, wB = (c[1] + c[3]) / base_each[0], (c[2] + c[4]) / base_each[1]
+                tot = (c[1] + c[2] + c[3] + c[4]) / base
+                nbk = len(bk)
+                se = lambda x: float(np.std(x, ddof=1) / math.sqrt(nbk)) if nbk > 1 else float("nan")  # ブロック間の標準誤差
+                se_tot = se((bk[:, 1] + bk[:, 2] + bk[:, 3] + bk[:, 4]) / base)
+                drip = (c[3] + c[4]) / max(1e-9, c[1] + c[2] + c[3] + c[4])
+                direct = (c[1] + c[2]) / base  # 縁からの滴下を含めない(直接の雨だけ)。滴下の仮定に左右されない値
+                rows[t] = dict(theta=t, phi=a.phi, lift_m=feas[t][3], feasible=1, wet_A=wA, wet_B=wB, wet_total=tot,
+                               wet_max=max(wA, wB), drip_share=drip, wet_direct=direct, wet_total_se=se_tot,
+                               wet_A_se=se((bk[:, 1] + bk[:, 3]) / base_each[0]), wet_B_se=se((bk[:, 2] + bk[:, 4]) / base_each[1]),
+                               wet_direct_se=se((bk[:, 1] + bk[:, 2]) / base))
+                print(f"θ={t:+3d}°  持上げ={feas[t][3]:.2f}m  濡れ率 A={wA:.3f} B={wB:.3f} 合計={tot:.3f}±{se_tot:.3f} (直接の雨のみ {direct:.3f} / 滴下の寄与 {100 * drip:.1f}%)")
+        rows = [rows[t] for t in thetas]
+
+        csv_path = os.path.join(a.out, f"result_phi{int(a.phi):03d}.csv")
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        th = [r["theta"] for r in rows]
+        plt.figure(figsize=(7, 4))
+        for k, lab, ls in [("wet_A", "A", "-"), ("wet_B", "B", "-"), ("wet_total", "total (with rim drips)", "-"),
+                           ("wet_direct", "total (direct rain only)", "--"), ("wet_max", "max(A,B)", "-")]:
+            plt.plot(th, [r[k] for r in rows], marker="o", linestyle=ls, label=lab)
+        plt.errorbar(th, [r["wet_total"] for r in rows], yerr=[r["wet_total_se"] for r in rows], fmt="none", ecolor="gray", capsize=3)
+        plt.xlabel("tilt angle [deg]")
+        plt.ylabel("wetness ratio (1 = no umbrella)")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.savefig(os.path.join(a.out, f"curve_phi{int(a.phi):03d}.png"), dpi=150, bbox_inches="tight")
+
+        ok = [r for r in rows if r["feasible"]]
+        if ok:
+            bt, bm = min(ok, key=lambda r: r["wet_total"]), min(ok, key=lambda r: r["wet_max"])
+            print(f"合計最小: θ={bt['theta']:+d}° / 不公平さ最小(maxの最小): θ={bm['theta']:+d}°  (INFEASIBLEの角度は除外)")
+        if ok:  # 最小値と誤差(2σ)の範囲で区別できない角度を示す(粒子数・測定時間が少ないと最適角度は決められない)
+            tie = [r["theta"] for r in ok if r["wet_total"] <= bt["wet_total"] + 2 * math.hypot(r["wet_total_se"], bt["wet_total_se"])]
+            if len(tie) > 1:
+                print(f"注意: 合計の濡れ率は θ={tie} が誤差(2σ)の範囲で区別できません。--measure-s を長く、--max-drops を増やすと絞れます。")
+        print(f"結果: {csv_path}")
+        return rows
+
+    all_rows = []
+    try:
+        for phi in phis:
+            print(f"\n===== 傾ける方位 φ={phi:.0f}° の測定 =====")
+            all_rows += sweep(phi)
+    except KeyboardInterrupt:  # Ctrl+C: ここまでに完了した方位の結果で summary を作る
+        print("\n中断されました。ここまでに完了した方位の結果で summary.md を作ります。")
+    if all_rows:
+        write_summary(a, all_rows, [p for p in phis if any(r["phi"] == p for r in all_rows)])
     else:
-        bs = min(len(todo), 4) if todo else 1
-    for i in range(0, len(todo), max(1, bs)):
-        chunk = todo[i:i + max(1, bs)]
-        vids = None if a.no_video else [os.path.join(a.out, f"phi{int(a.phi):03d}_theta{t:+03d}.mp4") for t in chunk]
-        hdr = [[f"tilt theta={t:+d} deg (phi={a.phi:.0f})  lift={feas[t][3]:.2f} m"] for t in chunk]
-        acc, blk = simulate([feas[t] for t in chunk], a.measure_s, vids, hdr)
-        for t, c, bk in zip(chunk, acc, blk):
-            wA, wB = (c[1] + c[3]) / base_each[0], (c[2] + c[4]) / base_each[1]
-            tot = (c[1] + c[2] + c[3] + c[4]) / base
-            nbk = len(bk)
-            se = lambda x: float(np.std(x, ddof=1) / math.sqrt(nbk)) if nbk > 1 else float("nan")  # ブロック間の標準誤差
-            se_tot = se((bk[:, 1] + bk[:, 2] + bk[:, 3] + bk[:, 4]) / base)
-            drip = (c[3] + c[4]) / max(1e-9, c[1] + c[2] + c[3] + c[4])
-            direct = (c[1] + c[2]) / base  # 縁からの滴下を含めない(直接の雨だけ)。滴下の仮定に左右されない値
-            rows[t] = dict(theta=t, phi=a.phi, lift_m=feas[t][3], feasible=1, wet_A=wA, wet_B=wB, wet_total=tot,
-                           wet_max=max(wA, wB), drip_share=drip, wet_direct=direct, wet_total_se=se_tot,
-                           wet_A_se=se((bk[:, 1] + bk[:, 3]) / base_each[0]), wet_B_se=se((bk[:, 2] + bk[:, 4]) / base_each[1]),
-                           wet_direct_se=se((bk[:, 1] + bk[:, 2]) / base))
-            print(f"θ={t:+3d}°  持上げ={feas[t][3]:.2f}m  濡れ率 A={wA:.3f} B={wB:.3f} 合計={tot:.3f}±{se_tot:.3f} (直接の雨のみ {direct:.3f} / 滴下の寄与 {100 * drip:.1f}%)")
-    rows = [rows[t] for t in thetas]
-
-    csv_path = os.path.join(a.out, f"result_phi{int(a.phi):03d}.csv")
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
-
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    th = [r["theta"] for r in rows]
-    plt.figure(figsize=(7, 4))
-    for k, lab, ls in [("wet_A", "A", "-"), ("wet_B", "B", "-"), ("wet_total", "total (with rim drips)", "-"),
-                       ("wet_direct", "total (direct rain only)", "--"), ("wet_max", "max(A,B)", "-")]:
-        plt.plot(th, [r[k] for r in rows], marker="o", linestyle=ls, label=lab)
-    plt.errorbar(th, [r["wet_total"] for r in rows], yerr=[r["wet_total_se"] for r in rows], fmt="none", ecolor="gray", capsize=3)
-    plt.xlabel("tilt angle [deg]")
-    plt.ylabel("wetness ratio (1 = no umbrella)")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.savefig(os.path.join(a.out, f"curve_phi{int(a.phi):03d}.png"), dpi=150, bbox_inches="tight")
-
-    ok = [r for r in rows if r["feasible"]]
-    if ok:
-        bt, bm = min(ok, key=lambda r: r["wet_total"]), min(ok, key=lambda r: r["wet_max"])
-        print(f"合計最小: θ={bt['theta']:+d}° / 不公平さ最小(maxの最小): θ={bm['theta']:+d}°  (INFEASIBLEの角度は除外)")
-    if ok:  # 最小値と誤差(2σ)の範囲で区別できない角度を示す(粒子数・測定時間が少ないと最適角度は決められない)
-        tie = [r["theta"] for r in ok if r["wet_total"] <= bt["wet_total"] + 2 * math.hypot(r["wet_total_se"], bt["wet_total_se"])]
-        if len(tie) > 1:
-            print(f"注意: 合計の濡れ率は θ={tie} が誤差(2σ)の範囲で区別できません。--measure-s を長く、--max-drops を増やすと絞れます。")
-    print(f"結果: {csv_path}")
-
+        print("完了した測定がありません。")
 
 if __name__ == "__main__":
     main()

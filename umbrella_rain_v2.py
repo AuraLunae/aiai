@@ -33,6 +33,7 @@ warnings.filterwarnings("ignore", message=".*torch.jit.script.*")  # Genesis 内
 
 import argparse
 import csv
+import ctypes
 import sys
 import time
 import types
@@ -54,6 +55,27 @@ from soft_render import soft_render
 
 V_DRIP = math.pi / 6 * 4.0**3  # 滴下する水滴(直径4mm)の体積 [mm^3]
 AXES = {"+x": (0, 1), "-x": (0, -1), "+y": (1, 1), "-y": (1, -1), "+z": (2, 1), "-z": (2, -1)}
+
+
+def restore_windows_stderr_handle():
+    """Restore stderr's Win32 handle after Genesis redirects the native stderr stream."""
+    if os.name != "nt":
+        return
+
+    import msvcrt
+    from ctypes import wintypes
+
+    try:
+        stderr_handle = msvcrt.get_osfhandle(sys.stderr.fileno())
+    except (AttributeError, OSError, ValueError) as exc:
+        raise RuntimeError("Windows stderr has no valid file handle for subprocesses.") from exc
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_std_handle = kernel32.SetStdHandle
+    set_std_handle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+    set_std_handle.restype = wintypes.BOOL
+    if not set_std_handle(0xFFFFFFF4, stderr_handle):  # STD_ERROR_HANDLE
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 # =============================================================================
@@ -1129,6 +1151,8 @@ def main():
         except Exception as e:
             print(f"⚠ Genesis を初期化できないため、CPUソフトレンダラに切り替えます({type(e).__name__}: {e})")
             soft = True
+    if not soft:
+        restore_windows_stderr_handle()
     if dev is None:
         dev = torch.device("cuda" if use_cuda else "cpu")
     if use_cuda:

@@ -22,7 +22,7 @@ import trimesh
 from scipy import ndimage
 
 import genesis as gs
-from umbrella_rain_v2 import build_assets, build_parser, place, to_np
+from umbrella_rain_v2 import build_assets, build_parser, place, restore_windows_stderr_handle, to_np
 
 
 def proxy_mesh(raw, pitch, fill):
@@ -48,6 +48,7 @@ def main():
     a = p.parse_args()
 
     gs.init(backend=gs.gpu, logging_level="warning", seed=a.seed)
+    restore_windows_stderr_handle()
     A = build_assets(a, gs.device)
     R, quat, H, lift = place(A, a, a.theta)
     if H is None:

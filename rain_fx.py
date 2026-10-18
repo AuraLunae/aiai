@@ -184,6 +184,15 @@ class RainRenderer:
             return
         d = torch.as_tensor(np.ascontiguousarray(depth), device=dev).float()
         fin = torch.isfinite(d) & (d > 0.05) & (d < 200.0)  # 背景は 0 や巨大値で返る環境もある
+        # 背景(空)の判定を強化: 遠クリップ面の値(例: 100m)など、有限だが物体ではない値で返る環境がある。
+        up = G.ray[..., 2] >= 0  # 地平線より上を向く画素(地面ではありえない)
+        fin = fin & ~(up & (d > 30.0))  # 地平線より上で 30m より遠い = 空
+        cand = up & fin
+        if bool(cand.any()):  # 上向き画素の depth の中央値が遠い定数なら、その定数の面を空とみなす
+            med = torch.median(d[cand])
+            const = cand & (torch.abs(d - med) < 0.01 * med)
+            if float(med) > 12.0 and float(const.float().mean()) > 0.05:
+                fin = fin & ~const
         d = torch.where(fin, d, torch.full_like(d, float("inf")))
         wz = G.pos[2] + torch.where(fin, d, torch.zeros_like(d)) * G.ray[..., 2]
         ground = fin & (torch.abs(wz) < 0.03)
@@ -372,4 +381,5 @@ class RainRenderer:
         out = self._post(img)
         if self.ss > 1:
             out = F.avg_pool2d(out.permute(2, 0, 1)[None], self.ss)[0].permute(1, 2, 0)
-        return out.round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        # SSAA縮小の結果は permute した非連続ビューになる。OpenCV(5系)は非連続配列を受け付けないので連続化して返す。
+        return np.ascontiguousarray(out.round().clamp(0, 255).to(torch.uint8).cpu().numpy())

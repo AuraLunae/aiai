@@ -83,10 +83,10 @@ def main():
 
     scene.add_entity(gs.morphs.Plane())
     # 見た目用(衝突なし)
-    scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.couple_glb), fixed=True, collision=False, parse_glb_with_zup=True))
+    scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.couple_glb), fixed=True, collision=False, **zup_kw(os.path.abspath(A.couple_glb))))
     scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.umb_glb), pos=tuple(float(x) for x in Hn),
                                     quat=tuple(float(x) for x in quat), fixed=True, collision=False,
-                                    parse_glb_with_zup=True))
+                                    **zup_kw(os.path.abspath(A.umb_glb))))
     # 衝突用プロキシ(非表示、閉じたメッシュ)
     for path in (u_path, p_path):
         scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(path), fixed=True, visualization=False, collision=True,

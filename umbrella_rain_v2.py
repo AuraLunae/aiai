@@ -27,6 +27,10 @@ v1 からの主な変更:
   uv run python umbrella_rain_v2.py --couple assets/couple.glb --umbrella assets/umbrella.glb --phi 90 --no-video
 """
 
+import warnings
+
+warnings.filterwarnings("ignore", message=".*torch.jit.script.*")  # Genesis 内部の非推奨警告(動作に影響しない)
+
 import argparse
 import csv
 import sys
@@ -200,6 +204,102 @@ def save_inspect(path, pts, labels, c, a, title):
     plt.close(fig)
 
 
+PALETTE = [  # 人物A(x<0) / 人物B(x>0)
+    dict(skin=(218, 166, 134), hair=(42, 31, 27), top=(163, 184, 212), pants=(54, 58, 70), shoes=(34, 31, 31)),
+    dict(skin=(233, 186, 156), hair=(80, 52, 37), top=(190, 108, 118), pants=(46, 60, 90), shoes=(226, 226, 229)),
+]
+EYE_WHITE, EYE_DARK = (238, 238, 236), (32, 24, 22)
+
+
+def _is_plain_grey(g):
+    try:
+        fc = np.asarray(g.visual.face_colors)
+        return bool(np.all(fc.reshape(-1, fc.shape[-1])[:, :3] == 150))
+    except Exception:
+        return False
+
+
+def humanize_couple(parts):
+    """3ds Max のワイヤー表示色(役割と無関係な緑・紫・赤など)を、自然な人間の配色(肌・髪・服・靴・目)に置き換える。
+    パーツごとに、人物ごとの身長 Hp に対する高さ・大きさ・位置から役割を判定する(座標は正規化後: z が高さ、x が二人を結ぶ軸)。
+      目      : 小さく(面積<0.012m²)頭の高さ(>0.85Hp)にある。三角形が多いものは白目、他は黒目
+      靴      : 上端が 0.12Hp 未満
+      頭まわり: 下端が 0.5Hp より上で、重心が 0.8Hp より上 または 上端が 0.95Hp 以上。その中で最も上に届くものが髪、残りは肌(頭・首)
+      全身の肌: 下端が地面付近で上端が 0.9Hp 以上 → 肌(服は別パーツ)
+      服      : 残りは重心が 0.55Hp より上ならトップス、下ならズボン
+      体と服が1枚のメッシュ(全身の肌が無く、服のパーツも無い人物の体): 面ごとに
+              首・頭=肌、靴、手(腕を下ろした位置)=肌、胴と袖=トップス、脚=ズボン と塗り分ける
+    配色は、「体と服が一体のメッシュ」を持つ人物にパレット0、そうでない人物にパレット1を使う(両方同じなら x<0 を0)。"""
+    feats = []
+    for g in parts:
+        V, F = np.asarray(g.vertices), np.asarray(g.faces)
+        t = V[F]
+        feats.append(dict(
+            area=float(0.5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1).sum()),
+            zmin=float(V[:, 2].min()), zmax=float(V[:, 2].max()), zc=float(V[:, 2].mean()), cx=float(V[:, 0].mean()), n=len(F)))
+    who = [0 if f["cx"] < 0 else 1 for f in feats]
+    roles, Hps = {0: {}, 1: {}}, {}
+    for pid in (0, 1):
+        idx = [i for i, w in enumerate(who) if w == pid]
+        if not idx:
+            continue
+        Hp = max(feats[i]["zmax"] for i in idx)
+        Hps[pid] = Hp
+        role = roles[pid]
+        for i in idx:
+            f = feats[i]
+            if f["area"] < 0.012 and f["zc"] > 0.85 * Hp:
+                role[i] = "eye_white" if f["n"] >= 600 else "eye_dark"
+            elif f["area"] < 0.012:
+                role[i] = "eye_dark"
+            elif f["zmax"] < 0.12 * Hp:
+                role[i] = "shoes"
+        rest = [i for i in idx if i not in role]
+        head = [i for i in rest if feats[i]["zmin"] > 0.5 * Hp and (feats[i]["zc"] > 0.8 * Hp or feats[i]["zmax"] >= 0.95 * Hp)]
+        if head:
+            hair = max(head, key=lambda i: feats[i]["zmax"])
+            for i in head:
+                role[i] = "hair" if i == hair else "skin"
+        rest = [i for i in idx if i not in role]
+        has_skin_body = any(feats[i]["zmin"] < 0.05 * Hp and feats[i]["zmax"] >= 0.9 * Hp for i in rest)
+        for i in rest:
+            f = feats[i]
+            if f["zmin"] < 0.05 * Hp and f["zmax"] >= 0.9 * Hp:
+                role[i] = "skin"
+            elif not has_skin_body and f["zmin"] < 0.05 * Hp and f["zmax"] > 0.6 * Hp:
+                role[i] = "painted"
+            else:
+                role[i] = "top" if f["zc"] > 0.55 * Hp else "pants"
+    painted = [pid for pid in (0, 1) if "painted" in roles[pid].values()]
+    pal_of = {0: 0, 1: 1}
+    if len(painted) == 1:
+        pal_of = {painted[0]: 0, 1 - painted[0]: 1}
+    summary = {0: {}, 1: {}}
+    for pid in (0, 1):
+        pal, Hp = PALETTE[pal_of[pid]], Hps.get(pid)
+        for i, r in roles[pid].items():
+            g = parts[i]
+            n = len(g.faces)
+            if r == "painted":
+                V, F = np.asarray(g.vertices), np.asarray(g.faces)
+                C = V[F].mean(1)
+                z, dx = C[:, 2], np.abs(C[:, 0] - V[:, 0].mean())
+                col = np.empty((n, 4), np.uint8)
+                col[:] = (*pal["pants"], 255)
+                col[z >= 0.53 * Hp] = (*pal["top"], 255)  # 胴と袖
+                col[(z > 0.43 * Hp) & (z < 0.59 * Hp) & (dx > 0.115 * Hp)] = (*pal["skin"], 255)  # 下ろした手
+                col[z < 0.05 * Hp] = (*pal["shoes"], 255)
+                col[z > 0.835 * Hp] = (*pal["skin"], 255)  # 首・頭
+                g.visual.face_colors = col
+            else:
+                c = {"skin": pal["skin"], "hair": pal["hair"], "top": pal["top"], "pants": pal["pants"], "shoes": pal["shoes"],
+                     "eye_white": EYE_WHITE, "eye_dark": EYE_DARK}[r]
+                g.visual.face_colors = [c[0], c[1], c[2], 255]
+            summary[pid][r] = summary[pid].get(r, 0) + 1
+    print("  人物の色: ワイヤー表示色を自然な配色(肌・髪・服・靴・目)に置き換えました "
+          + " / ".join(f"{'AB'[p]}: " + ", ".join(f"{k}×{v}" for k, v in sorted(d.items())) for p, d in summary.items() if d))
+
+
 def infer_scale(raw_size, lo, hi, fallback):
     """元データの単位を推定(m/cm/mm)。想定サイズ範囲[lo,hi]m に入る倍率を採用、無ければ既定サイズに正規化。"""
     for f, nm in ((1.0, "m"), (0.01, "cm"), (0.001, "mm")):
@@ -247,7 +347,8 @@ def prep_model(path, kind, axis_arg, size, grip, cache, keep_all, a=None):
 
         dumped = []
         for q in load_obj_parts(path):
-            g = trimesh.Trimesh(vertices=q["V"], faces=q["F"], process=False, metadata={"name": q["name"]})
+            g = trimesh.Trimesh(vertices=q["V"], faces=q["F"], process=False,
+                                metadata={"name": q["name"], "wire": mtl_color(q["mtl"]) is not None})  # 3ds Max のワイヤー表示色か
             col = mtl_color(q["mtl"]) or (150, 150, 150)  # 'wire_RRRGGGBBB' 形式なら色として使う
             g.visual.face_colors = [col[0], col[1], col[2], 255]
             dumped.append(g)
@@ -416,6 +517,14 @@ def prep_model(path, kind, axis_arg, size, grip, cache, keep_all, a=None):
             print(f"  二人の中心間距離を {pair['sep']:.2f} → {a.couple_spacing:.2f} m に調整" + (f"(⚠ 二人にまたがるパーツ {straddle} 個は歪みます)" if straddle else ""))
         else:
             print("  ⚠ 二人を検出できていないため --couple-spacing は無視します")
+    if kind == "couple":
+        mode = getattr(a, "couple_colors", "auto")
+        unnatural = any(g.metadata.get("wire") for g in parts) or all(_is_plain_grey(g) for g in parts)
+        if mode == "natural" or (mode == "auto" and unnatural):
+            if pair["ok"]:
+                humanize_couple(parts)
+            else:
+                print("  ⚠ 二人を検出できていないため、人物の色の自動配色は行いません")
     sc = trimesh.Scene(parts)
     phys = trimesh.util.concatenate(parts)
     fcs = []  # 面ごとの色(ソフトレンダラ用)。パーツの並び順 = concatenate後の面の並び順
@@ -861,6 +970,7 @@ def build_parser():
     p.add_argument("--inspect", action="store_true", help="モデルの前処理(軸推定)だけ行って確認図を出力して終了")
     p.add_argument("--couple-height", type=float, default=None, help="省略時は単位(m/cm/mm)を自動推定。指定すると最大寸法をこの身長[m]に正規化")
     p.add_argument("--umbrella-diameter", type=float, default=None, help="省略時は単位を自動推定。指定すると傘の直径[m]に正規化")
+    p.add_argument("--couple-colors", default="auto", choices=["auto", "natural", "original"], help="人物の色。auto=3ds Maxのワイヤー表示色など実際の色でない場合に自然な配色(肌・髪・服・靴・目)にする / natural=常に自然な配色 / original=元の色のまま")
     p.add_argument("--umbrella-color", type=int, nargs=3, default=None, help="傘の布の色 R G B(0-255)。省略時は、モデルに色情報が無ければ紺(35 60 125)")
     p.add_argument("--couple-spacing", type=float, default=None, help="二人の中心間距離[m]に調整(省略=モデルのまま)")
     p.add_argument("--grip-offset", type=float, default=0.25)
@@ -920,6 +1030,18 @@ def build_parser():
 def theta_list(a):
     """測定する傾き量[度]。刻みの倍数だけを使うので、範囲に含まれていれば 0° は必ず入る。"""
     return sorted(t for t in range(a.theta_min, a.theta_max + 1) if t % a.step == 0)
+
+
+def zup_kw(path):
+    """glb を Z-up として読むための Genesis の Mesh キーワード。バージョンで名前が違う
+    (旧 parse_glb_with_zup → 新 file_meshes_are_zup)ので、受け付けられる方を返す。"""
+    for k in ("file_meshes_are_zup", "parse_glb_with_zup"):
+        try:
+            gs.morphs.Mesh(file=path, **{k: True})
+            return {k: True}
+        except Exception:
+            continue
+    return {}
 
 
 def print_plan(a, use_cuda, prof, phis):
@@ -1002,7 +1124,7 @@ def main():
     dev = None
     if not soft:
         try:
-            gs.init(backend=gs.gpu if use_cuda else gs.cpu, logging_level="warning", seed=a.seed)
+            gs.init(backend=gs.gpu if use_cuda else gs.cpu, logging_level="error", seed=a.seed)  # 描画専用モデルの「非水密」警告を出さない
             dev = gs.device
         except Exception as e:
             print(f"⚠ Genesis を初期化できないため、CPUソフトレンダラに切り替えます({type(e).__name__}: {e})")
@@ -1061,6 +1183,7 @@ def main():
 
     if not soft:
         try:
+            zup = zup_kw(os.path.abspath(A.couple_glb))
             vis = None
             for kw in (dict(background_color=(0.55, 0.60, 0.66), ambient_light=(0.55, 0.55, 0.60), shadow=True,
                              lights=[dict(type="directional", dir=(-0.35, -0.45, -0.82), color=(1.0, 1.0, 1.02), intensity=3.0)]),
@@ -1075,9 +1198,9 @@ def main():
                 scene.add_entity(gs.morphs.Plane(), surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.20, 0.20, 0.22))))
             except Exception:
                 scene.add_entity(gs.morphs.Plane())
-            scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.couple_glb), fixed=True, collision=False, parse_glb_with_zup=True))
+            scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.couple_glb), fixed=True, collision=False, **zup))
             umb = scene.add_entity(gs.morphs.Mesh(file=os.path.abspath(A.umb_glb), pos=tuple(float(x) for x in A.hold),
-                                                  fixed=False, collision=False, parse_glb_with_zup=True))
+                                                  fixed=False, collision=False, **zup))
             cam = scene.add_camera(res=(W, Hh), pos=tuple(a.cam_pos), lookat=tuple(a.cam_lookat), fov=a.fov, GUI=False)
             scene.build()
             # 描画の自己診断: 実際に1枚描き、depth の定義(前方距離か直線距離か)を自動判定する
@@ -1126,6 +1249,7 @@ def main():
         return rgb, depth
 
     def put_text(img, lines):
+        img = np.ascontiguousarray(img)  # OpenCV(5系)は非連続配列に描けない
         sc = img.shape[1] / 1280.0
         for i, t in enumerate(lines):
             cv2.putText(img, t, (int(20 * sc), int((40 + 34 * i) * sc)), cv2.FONT_HERSHEY_SIMPLEX, 0.85 * sc,
@@ -1239,6 +1363,12 @@ def main():
         rr = make_renderer()
         rr.prepare(rgb, depth)
         gr = float(rr.ground.float().mean())
+        if depth is not None:  # 空の判定の診断: 地平線より上を向く画素の depth(空が遠い定数で返る環境の確認用)
+            up_ = cam_geo.ray[..., 2] >= 0
+            du = depth[up_]
+            du = du[np.isfinite(du) & (du > 0)]
+            if len(du):
+                print(f"地平線より上の画素の depth: 最小 {du.min():.1f} / 中央値 {np.median(du):.1f} / 最大 {du.max():.1f} m(空は遠い定数になっているはず)")
         print(f"地面として検出されたピクセル: {100 * gr:.1f}%  背景(空)として扱ったピクセル: {100 * float((~torch.isfinite(rr.depth)).float().mean()):.1f}%")
         if not a.no_depth and gr < 0.01:
             print("⚠ 地面を検出できません。depth の定義が違う可能性があります → --depth-mode distance を試すか、--no-depth で切り分けてください。")

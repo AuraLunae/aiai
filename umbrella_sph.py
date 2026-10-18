@@ -22,7 +22,7 @@ import trimesh
 from scipy import ndimage
 
 import genesis as gs
-from umbrella_rain_v2 import build_assets, build_parser, place, restore_windows_stderr_handle, to_np
+from umbrella_rain_v2 import build_assets, build_parser, place, restore_windows_stderr_handle, to_np, zup_kw
 
 
 def proxy_mesh(raw, pitch, fill):

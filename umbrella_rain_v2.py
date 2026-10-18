@@ -34,6 +34,7 @@ warnings.filterwarnings("ignore", message=".*torch.jit.script.*")  # Genesis 内
 import argparse
 import csv
 import ctypes
+import subprocess
 import sys
 import time
 import types
@@ -43,6 +44,7 @@ import os
 
 import cv2
 import imageio
+from imageio_ffmpeg import get_ffmpeg_exe
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -76,6 +78,43 @@ def restore_windows_stderr_handle():
     set_std_handle.restype = wintypes.BOOL
     if not set_std_handle(0xFFFFFFF4, stderr_handle):  # STD_ERROR_HANDLE
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+def probe_nvenc_sessions(count, width, height, fps, crf):
+    """Return FFmpeg errors from a concurrent NVENC probe matching the video batch size."""
+    command = [
+        get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-re",
+        "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}",
+        "-frames:v", str(max(1, fps * 2)), "-an", "-c:v", "h264_nvenc",
+        "-cq", str(crf), "-preset", "p5", "-f", "null", "-",
+    ]
+    processes = []
+    try:
+        for _ in range(count):
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            )
+
+        errors = []
+        for process in processes:
+            _, stderr = process.communicate(timeout=30)
+            if process.returncode != 0:
+                lines = stderr.decode("utf-8", errors="replace").splitlines()
+                error = next((line.strip() for line in lines if "OpenEncodeSessionEx" in line), "")
+                errors.append(error or next((line.strip() for line in reversed(lines) if line.strip()), "NVENC probe failed"))
+        return errors
+    except BaseException:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+        for process in processes:
+            process.communicate()
+        raise
 
 
 # =============================================================================
@@ -1023,7 +1062,7 @@ def build_parser():
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--crf", type=int, default=20, help="動画の画質(小さいほど高画質・大容量。18〜24が目安)")
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="auto=CUDAがあればGPU(既定)")
-    p.add_argument("--encoder", default="auto", choices=["auto", "libx264", "nvenc"], help="auto=GPUならNVENC、失敗または非GPUならlibx264")
+    p.add_argument("--encoder", default="auto", choices=["auto", "libx264", "nvenc"], help="auto=GPUならNVENCを事前検証し、使えなければlibx264")
     p.add_argument("--env-batch", type=int, default=-1, help="同時に計算する角度数。-1=VRAMの空きから自動(既定) / 0=全角度 / 正の数=指定")
     p.add_argument("--res", type=int, nargs=2, default=[1280, 720])
     p.add_argument("--cam-pos", type=float, nargs=3, default=[2.0, 4.3, 1.5], help="人は+y向きに歩いている想定(正面斜め前)。向きが違えば変更")
@@ -1281,10 +1320,10 @@ def main():
         return img
 
     class Writer:
-        """動画書き出し。nvenc が使えなければ最初のフレームで自動的に libx264 へ切り替える。"""
+        """動画書き出し。エンコーダーは動画作成前に選択済み。"""
 
         def __init__(self, path):
-            self.path, self.first, self.w, self.enc = path, [], None, enc_pref
+            self.path, self.w, self.enc = path, None, enc_pref
             self._open()
 
         def _open(self):
@@ -1294,18 +1333,7 @@ def main():
                 self.w = imageio.get_writer(self.path, fps=a.fps, codec="libx264", macro_block_size=2, output_params=["-crf", str(a.crf), "-preset", "medium"])
 
         def append(self, img):
-            try:
-                self.w.append_data(img)
-                if len(self.first) < 2:
-                    self.first.append(img)
-            except Exception:
-                if self.enc != "nvenc":
-                    raise
-                print("  (nvenc が使えないため libx264 に切り替えます)")
-                self.enc = "libx264"
-                self._open()
-                for f in self.first + [img]:
-                    self.w.append_data(f)
+            self.w.append_data(img)
 
         def close(self):
             self.w.close()
@@ -1415,6 +1443,7 @@ def main():
 
     def sweep(phi):
         """方位 phi について全角度を測定し、動画・CSV・グラフを出力して行のリストを返す。"""
+        nonlocal enc_pref
         a.phi = phi
         # --- 各角度の傘の姿勢を決める(干渉解決) → 実現可能なものを env-batch 個ずつまとめて同時に計算 ---
         thetas = theta_list(a)
@@ -1446,6 +1475,11 @@ def main():
             print(f"同時に計算する角度数: {bs} (VRAM空き {free / 2**30:.1f} GB から自動決定。--env-batch で変更可)")
         else:
             bs = min(len(todo), 4) if todo else 1
+        if enc_pref == "nvenc" and not a.no_video and todo:
+            probe_errors = probe_nvenc_sessions(min(bs, len(todo)), W, Hh, a.fps, a.crf)
+            if probe_errors:
+                print(f"⚠ NVENC を {min(bs, len(todo))} 本同時に使えないため、全動画を libx264 で作成します: {probe_errors[0]}")
+                enc_pref = "libx264"
         pos_i = 0
         while pos_i < len(todo):
             chunk = todo[pos_i:pos_i + max(1, bs)]

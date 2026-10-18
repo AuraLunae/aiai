@@ -1476,10 +1476,18 @@ def main():
         else:
             bs = min(len(todo), 4) if todo else 1
         if enc_pref == "nvenc" and not a.no_video and todo:
-            probe_errors = probe_nvenc_sessions(min(bs, len(todo)), W, Hh, a.fps, a.crf)
+            nvenc_batch = min(bs, len(todo))
+            while True:
+                probe_errors = probe_nvenc_sessions(nvenc_batch, W, Hh, a.fps, a.crf)
+                if not probe_errors or nvenc_batch == 1:
+                    break
+                nvenc_batch = max(1, nvenc_batch // 2)
             if probe_errors:
-                print(f"⚠ NVENC を {min(bs, len(todo))} 本同時に使えないため、全動画を libx264 で作成します: {probe_errors[0]}")
+                print(f"⚠ NVENC を1本でも起動できないため、全動画を libx264 で作成します: {probe_errors[0]}")
                 enc_pref = "libx264"
+            elif nvenc_batch < bs:
+                bs = nvenc_batch
+                print(f"NVENC の同時セッション数に合わせ、同時に計算する角度数を {bs} に制限します")
         pos_i = 0
         while pos_i < len(todo):
             chunk = todo[pos_i:pos_i + max(1, bs)]
